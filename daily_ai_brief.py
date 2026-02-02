@@ -3,9 +3,9 @@
 Skrypt: AI Engineers Daily Brief z X.com → email (SMTP)
 
 Funkcje:
-- pobiera najnowsze tweety z X API v2 z wybranych kont,
+- pobiera najnowsze tweety z X.com przez RSS feeds (RSSHub),
 - filtruje tylko posty z ostatnich 24 godzin,
-- sortuje je według ważności (polubienia, reposty, odpowiedzi),
+- sortuje je według ważności (daty publikacji, długości treści),
 - generuje długi brief mailowy po polsku,
 - wysyła mail przez SMTP.
 
@@ -14,11 +14,14 @@ Konfiguracja odbywa się wyłącznie przez zmienne środowiskowe (.env lub syste
 
 import os
 import sys
+import re
 from datetime import datetime, timedelta, timezone
 from collections import Counter
 from typing import Any, Dict, List
+from urllib.parse import urlparse, parse_qs
 
 import requests
+import feedparser
 from email.message import EmailMessage
 import smtplib
 
@@ -33,14 +36,13 @@ except ImportError:
 
 
 # ==========================
-# Konfiguracja X (Twitter) API v2
+# Konfiguracja RSS feeds dla X.com
 # ==========================
 
-# IMPORTANT:
-# X_BEARER_TOKEN powinien być ustawiony jako zmienna środowiskowa.
-# Przykład w bashu:
-#   export X_BEARER_TOKEN="twój_token_z_panelu_X"
-X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN")
+# Używamy RSSHub jako źródła RSS feedów dla X.com
+# RSSHub to darmowy serwis, który generuje RSS z różnych platform, w tym X.com
+# Alternatywnie możesz użyć własnej instancji RSSHub lub innych serwisów
+RSSHUB_BASE_URL = os.getenv("RSSHUB_BASE_URL", "https://rsshub.app")
 
 # Konta, z których pobieramy tweety (usernames)
 X_USERS = [
@@ -55,18 +57,17 @@ X_USERS = [
     "daveshap",
 ]
 
-X_SEARCH_URL = "https://api.twitter.com/2/tweets/search/recent"
-
-# Budujemy zapytanie typu:
-# (from:elonmusk OR from:ilyasut OR ...) -is:retweet
-X_QUERY = "(" + " OR ".join(f"from:{u}" for u in X_USERS) + ") -is:retweet"
-
-X_SEARCH_PARAMS: Dict[str, str] = {
-    "query": X_QUERY,
-    "max_results": "100",  # maksymalnie 100 najnowszych tweetów
-    "tweet.fields": "created_at,public_metrics,lang",
-    "expansions": "author_id",
-    "user.fields": "name,username",
+# Mapowanie username -> pełne imię (dla lepszej czytelności w briefie)
+AUTHOR_NAMES = {
+    "elonmusk": "Elon Musk",
+    "ilyasut": "Ilya Sutskever",
+    "DrJimFan": "Dr Jim Fan",
+    "ylecun": "Yann LeCun",
+    "GavinSBaker": "Gavin Baker",
+    "Yuchenj_UW": "Yuchen Jin",
+    "zeeshanp_": "Zeeshan Patel",
+    "demishassabis": "Demis Hassabis",
+    "daveshap": "David Shapiro",
 }
 
 
@@ -79,101 +80,123 @@ def require_env(var_name: str) -> str:
     return value
 
 
-def fetch_tweets() -> Dict[str, Any]:
+def fetch_tweets_from_rss() -> List[Dict[str, Any]]:
     """
-    Pobierz najnowsze tweety z X API v2.
+    Pobierz najnowsze tweety z X.com przez RSS feeds (RSSHub).
 
-    Używamy endpointu /2/tweets/search/recent z autoryzacją Bearer Token.
-    Token jest pobierany ze zmiennej środowiskowej X_BEARER_TOKEN.
+    RSSHub generuje RSS feed dla każdego użytkownika X.com.
+    Endpoint: https://rsshub.app/twitter/user/USERNAME
+
+    Zwraca listę wszystkich tweetów ze wszystkich kont.
     """
-    if not X_BEARER_TOKEN:
-        print("BŁĄD: Zmienna środowiskowa X_BEARER_TOKEN nie jest ustawiona.", file=sys.stderr)
-        sys.exit(1)
+    all_tweets: List[Dict[str, Any]] = []
 
-    headers = {
-        # Kluczowy nagłówek autoryzacyjny dla X API v2
-        "Authorization": f"Bearer {X_BEARER_TOKEN}",
-    }
-
-    response = requests.get(X_SEARCH_URL, headers=headers, params=X_SEARCH_PARAMS, timeout=30)
-    if not response.ok:
-        print(f"BŁĄD: X API zwróciło kod {response.status_code}: {response.text}", file=sys.stderr)
-        sys.exit(1)
-
-    return response.json()
-
-
-def parse_tweets(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Przetwórz odpowiedź z X API v2 do ujednoliconej listy tweetów.
-
-    Każdy element listy ma pola:
-    - author_name
-    - author_username
-    - created_at (datetime w UTC)
-    - text
-    - likes
-    - retweets
-    - replies
-    - quotes
-    - url
-    """
-    data = raw.get("data", []) or []
-    includes = raw.get("includes", {}) or {}
-    users = includes.get("users", []) or []
-
-    user_map: Dict[str, Dict[str, Any]] = {}
-    for u in users:
-        if "id" in u:
-            user_map[u["id"]] = u
-
-    tweets: List[Dict[str, Any]] = []
-
-    for t in data:
-        text = t.get("text", "")
-        if not text:
-            continue
-
-        created_at_str = t.get("created_at")
-        if not created_at_str:
-            continue
+    for username in X_USERS:
+        rss_url = f"{RSSHUB_BASE_URL}/twitter/user/{username}"
+        print(f"Pobieram RSS dla @{username}...", end=" ")
 
         try:
-            # X API stosuje format ISO 8601, np. "2024-02-01T10:23:45.000Z"
-            created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
-        except ValueError:
-            # Jeśli format daty jest nieprawidłowy, pomijamy tweeta
+            # RSSHub może wymagać User-Agent, dodajemy go dla pewności
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+            response = requests.get(rss_url, headers=headers, timeout=30)
+
+            if not response.ok:
+                print(f"BŁĄD: RSSHub zwróciło kod {response.status_code} dla @{username}")
+                continue
+
+            # Parsuj RSS feed
+            feed = feedparser.parse(response.content)
+
+            if feed.bozo:
+                print(f"BŁĄD: Nieprawidłowy format RSS dla @{username}")
+                continue
+
+            # Przetwórz każdy wpis z feeda
+            for entry in feed.entries:
+                # RSSHub zwykle zawiera link do tweeta w formacie:
+                # https://twitter.com/USERNAME/status/TWEET_ID
+                # lub https://x.com/USERNAME/status/TWEET_ID
+                link = entry.get("link", "")
+                tweet_id = extract_tweet_id_from_url(link)
+
+                # Parsuj datę publikacji
+                published_time = None
+                if hasattr(entry, "published_parsed") and entry.published_parsed:
+                    try:
+                        published_time = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+                    except (ValueError, TypeError):
+                        pass
+
+                # Jeśli nie ma parsed date, spróbuj z published string
+                if not published_time and hasattr(entry, "published"):
+                    try:
+                        # feedparser czasami parsuje daty automatycznie
+                        if hasattr(entry, "published_parsed"):
+                            published_time = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+                        else:
+                            # Fallback: spróbuj sparsować ręcznie
+                            published_time = datetime.now(timezone.utc)
+                    except:
+                        published_time = datetime.now(timezone.utc)
+
+                if not published_time:
+                    published_time = datetime.now(timezone.utc)
+
+                # Tekst tweeta - może być w title lub summary
+                text = entry.get("title", "") or entry.get("summary", "")
+                # Usuń HTML tags jeśli są
+                text = re.sub(r"<[^>]+>", "", text)
+                text = text.strip()
+
+                if not text:
+                    continue
+
+                # Autor - może być w author lub wyciągnięty z linku/tytułu
+                author_name = AUTHOR_NAMES.get(username, username)
+                author_username = username
+
+                all_tweets.append(
+                    {
+                        "author_name": author_name,
+                        "author_username": author_username,
+                        "created_at": published_time,
+                        "text": text,
+                        "likes": 0,  # RSS nie zawiera metryk
+                        "retweets": 0,
+                        "replies": 0,
+                        "quotes": 0,
+                        "url": link if link else f"https://x.com/{username}/status/{tweet_id}" if tweet_id else "",
+                    }
+                )
+
+            print(f"OK ({len(feed.entries)} tweetów)")
+        except Exception as e:
+            print(f"BŁĄD: {e}")
             continue
 
-        author_id = t.get("author_id")
-        user = user_map.get(author_id, {})
-        author_username = user.get("username", author_id or "unknown")
-        author_name = user.get("name", author_username)
+    return all_tweets
 
-        metrics = t.get("public_metrics", {}) or {}
-        likes = int(metrics.get("like_count", 0))
-        retweets = int(metrics.get("retweet_count", 0))
-        replies = int(metrics.get("reply_count", 0))
-        quotes = int(metrics.get("quote_count", 0))
 
-        tweet_id = t.get("id")
-        url = f"https://x.com/i/status/{tweet_id}" if tweet_id else ""
+def extract_tweet_id_from_url(url: str) -> str:
+    """Wyciągnij ID tweeta z URL (np. z https://x.com/user/status/123456789)."""
+    if not url:
+        return ""
+    # Próbuj wyciągnąć ID z różnych formatów URL
+    patterns = [
+        r"/status/(\d+)",
+        r"status/(\d+)",
+        r"tweet_id=(\d+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return ""
 
-        tweets.append(
-            {
-                "author_name": author_name,
-                "author_username": author_username,
-                "created_at": created_at,
-                "text": text,
-                "likes": likes,
-                "retweets": retweets,
-                "replies": replies,
-                "quotes": quotes,
-                "url": url,
-            }
-        )
 
-    return tweets
+# Funkcja parse_tweets() nie jest już potrzebna - fetch_tweets_from_rss() zwraca już gotową listę
 
 
 def filter_last_24h(tweets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -187,15 +210,24 @@ def importance_score(tweet: Dict[str, Any]) -> int:
     """
     Prosty score ważności posta.
 
-    Możesz dowolnie zmienić wagi, np. bardziej premiować reposty.
+    Ponieważ RSS nie zawiera metryk (likes, retweets), używamy heurystyki:
+    - Dłuższe tweety są często bardziej wartościowe
+    - Nowsze tweety są ważniejsze
+    - Możemy też użyć długości tekstu jako proxy dla zaangażowania
     """
-    likes = int(tweet.get("likes", 0))
-    retweets = int(tweet.get("retweets", 0))
-    replies = int(tweet.get("replies", 0))
-    quotes = int(tweet.get("quotes", 0))
+    text = tweet.get("text", "")
+    text_length = len(text)
 
-    # Wagi: like=3, retweet=2, reply=1, quote=2
-    return likes * 3 + retweets * 2 + replies * 1 + quotes * 2
+    # Podstawowy score oparty na długości (dłuższe = ważniejsze)
+    # Dodajemy też bonus za "nowość" (ale to już jest w sortowaniu)
+    base_score = min(text_length // 10, 100)  # max 100 punktów za długość
+
+    # Bonus za zawartość słów kluczowych związanych z AI/ML
+    ai_keywords = ["ai", "ml", "model", "neural", "llm", "gpt", "training", "research", "paper"]
+    text_lower = text.lower()
+    keyword_bonus = sum(10 for keyword in ai_keywords if keyword in text_lower)
+
+    return base_score + keyword_bonus
 
 
 def sort_by_importance(tweets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -262,7 +294,11 @@ def generate_email_body(tweets: List[Dict[str, Any]]) -> str:
 
         lines.append(f"### {idx}. {author_name} (@{author_username})")
         lines.append(f"- **Data**: {created_local_str}")
-        lines.append(f"- **Ważność** (score): {score}  |  ❤ {likes}  🔁 {retweets}  💬 {replies}")
+        # RSS nie zawiera metryk, więc pomijamy wyświetlanie likes/retweets jeśli są zerowe
+        if likes > 0 or retweets > 0 or replies > 0:
+            lines.append(f"- **Ważność** (score): {score}  |  ❤ {likes}  🔁 {retweets}  💬 {replies}")
+        else:
+            lines.append(f"- **Ważność** (score): {score}")
         lines.append("")
         lines.append("**Krótki opis posta:**")
         lines.append(shorten_text(text, max_len=400))
@@ -284,12 +320,17 @@ def generate_email_body(tweets: List[Dict[str, Any]]) -> str:
         f"W ciągu ostatnich 24 godzin zarejestrowano {total_posts} istotnych postów od wybranych inżynierów i badaczy AI."
     )
     lines.append(
-        f"Najbardziej aktywny był(a) **{top_author}**, z liczbą {top_count} postów, które wygenerowały łącznie wiele interakcji."
+        f"Najbardziej aktywny był(a) **{top_author}**, z liczbą {top_count} postów."
     )
-    lines.append(
-        f"Łącznie posty zebrały około {total_likes} polubień, {total_retweets} repostów i {total_replies} odpowiedzi, "
-        "koncentrując się głównie na tematach związanych z rozwojem modeli, produktami opartymi o AI oraz dyskusjami o przyszłości branży."
-    )
+    if total_likes > 0 or total_retweets > 0 or total_replies > 0:
+        lines.append(
+            f"Łącznie posty zebrały około {total_likes} polubień, {total_retweets} repostów i {total_replies} odpowiedzi, "
+            "koncentrując się głównie na tematach związanych z rozwojem modeli, produktami opartymi o AI oraz dyskusjami o przyszłości branży."
+        )
+    else:
+        lines.append(
+            "Posty koncentrują się głównie na tematach związanych z rozwojem modeli, produktami opartymi o AI oraz dyskusjami o przyszłości branży."
+        )
 
     return "\n".join(lines)
 
@@ -343,17 +384,15 @@ def send_email(subject: str, body: str) -> None:
 
 
 def main() -> None:
-    # Proaktyczna walidacja kilku kluczowych zmiennych środowiskowych
-    require_env("X_BEARER_TOKEN")
+    # Proaktyczna walidacja kluczowych zmiennych środowiskowych (tylko SMTP, X_BEARER_TOKEN nie jest już potrzebny)
     require_env("SMTP_HOST")
     require_env("SMTP_USER")
     require_env("SMTP_PASSWORD")
     require_env("SMTP_FROM")
     require_env("SMTP_TO")
 
-    print("Pobieram tweety z X API v2...")
-    raw = fetch_tweets()
-    tweets = parse_tweets(raw)
+    print("Pobieram tweety z X.com przez RSS feeds (RSSHub)...")
+    tweets = fetch_tweets_from_rss()
     print(f"Łączna liczba pobranych tweetów: {len(tweets)}")
 
     recent = filter_last_24h(tweets)
